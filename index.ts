@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as readline from 'readline';
+import { once } from 'events';
 
 
 interface Posicionamento {
@@ -22,113 +23,139 @@ interface Encontro {
     distanciaMetros: number;
 }
 
+const RAIO_TERRA = 6371000;
+const DISTANCIA_LIMITE = 20;
+const GRAUS_PARA_RAD = Math.PI / 180;
+
 function calcularDistancia(lat1: number, lon1: number, lat2: number, lon2: number): number {
-    const R = 6371000;
-    const dLat = (lat2 - lat1) * (Math.PI / 180);
-    const dLon = (lon2 - lon1) * (Math.PI / 180);
-    
+    const dLat = (lat2 - lat1) * GRAUS_PARA_RAD;
+    const dLon = (lon2 - lon1) * GRAUS_PARA_RAD;
+
     const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-              Math.cos(lat1 * (Math.PI / 180)) * Math.cos(lat2 * (Math.PI / 180)) *
+              Math.cos(lat1 * GRAUS_PARA_RAD) * Math.cos(lat2 * GRAUS_PARA_RAD) *
               Math.sin(dLon / 2) * Math.sin(dLon / 2);
-              
+
     const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    return R * c;
+    return RAIO_TERRA * c;
 }
 
-// --- FUNÇÃO ASSÍNCRONA COM LEITURA LINHA A LINHA ---
-async function processarDataset(numeroDataset: number) {
-    const nomeFicheiroInput = `dataset${numeroDataset}.txt`;
-    const nomeFicheiroOutput = `respostas${numeroDataset}.json`;
-    
-    if (!fs.existsSync(nomeFicheiroInput)) {
-        return;
+function classificarEncontro(p1: Posicionamento, p2: Posicionamento): string {
+    const p1Agressor = p2.medidaProtetiva && p2.idsRestricaoMedida.includes(p1.idMonitorado);
+    const p2Agressor = p1.medidaProtetiva && p1.idsRestricaoMedida.includes(p2.idMonitorado);
+
+    if (p1Agressor || p2Agressor) {
+        return 'protetiva';
     }
-
-    console.log(`A processar ${nomeFicheiroInput} (leitura otimizada por stream)...`);
-    
-    const posicionamentos: Posicionamento[] = [];
-    
-    // Configura Stream
-    const fileStream = fs.createReadStream(nomeFicheiroInput);
-    const rl = readline.createInterface({
-        input: fileStream,
-        crlfDelay: Infinity
-    });
-
-    let isPrimeiraLinha = true;
-
-    // 1. LER DADOS LINHA A LINHA )
-    for await (const linha of rl) {
-        if (isPrimeiraLinha) {
-            isPrimeiraLinha = false;
-            continue; 
-        }
-        if (!linha) continue;
-
-        const colunas = linha.split(';');
-
-        posicionamentos.push({
-            idMonitorado: Number(colunas[0]),
-            faccaoMonitorado: colunas[1],
-            timestamp: colunas[2].replace(/"/g, ''),
-            latitude: Number(colunas[3]),
-            longitude: Number(colunas[4]),
-            medidaProtetiva: colunas[5] === 'true',
-            idsRestricaoMedida: colunas[6] ? colunas[6].replace(/"/g, '').split(',').map(Number) : []
-        });
+    if (p1.faccaoMonitorado !== '' && p1.faccaoMonitorado === p2.faccaoMonitorado) {
+        return 'faccao';
     }
+    return 'generico';
+}
 
-    // 2. AGRUPAR POR TEMPO
-    const posicoesPorTempo = new Map<string, Posicionamento[]>();
-    for (const p of posicionamentos) {
-        if (!posicoesPorTempo.has(p.timestamp)) {
-            posicoesPorTempo.set(p.timestamp, []);
-        }
-        posicoesPorTempo.get(p.timestamp)!.push(p);
-    }
+// Compara todos os pares de um único timestamp e acumula os encontros encontrados.
+function detectarEncontros(horario: string, pessoas: Posicionamento[], encontros: Encontro[]): void {
+    for (let i = 0; i < pessoas.length; i++) {
+        const p1 = pessoas[i]!;
+        for (let j = i + 1; j < pessoas.length; j++) {
+            const p2 = pessoas[j]!;
 
-    // 3. DETETAR ENCONTROS
-    const encontrosDetetados: Encontro[] = [];
-    for (const [horario, pessoas] of posicoesPorTempo.entries()) {
-        for (let i = 0; i < pessoas.length; i++) {
-            for (let j = i + 1; j < pessoas.length; j++) {
-                const p1 = pessoas[i];
-                const p2 = pessoas[j];
-                const distancia = calcularDistancia(p1.latitude, p1.longitude, p2.latitude, p2.longitude);
+            // Pré-filtro exato: a distância de Haversine nunca é menor que R * |dLat|.
+            // Se só a diferença de latitude já passa de 20 m, o par não é encontro.
+            if (RAIO_TERRA * Math.abs(p2.latitude - p1.latitude) * GRAUS_PARA_RAD >= DISTANCIA_LIMITE) {
+                continue;
+            }
 
-                if (distancia < 20) {
-                    let tipo = 'generico';
-                    const p1Agressor = p2.medidaProtetiva && p2.idsRestricaoMedida.includes(p1.idMonitorado);
-                    const p2Agressor = p1.medidaProtetiva && p1.idsRestricaoMedida.includes(p2.idMonitorado);
-                    
-                    if (p1Agressor || p2Agressor) {
-                        tipo = 'protetiva';
-                    } else if (p1.faccaoMonitorado !== '' && p1.faccaoMonitorado === p2.faccaoMonitorado) {
-                        tipo = 'faccao';
-                    }
-
-                    encontrosDetetados.push({
-                        tipo: tipo,
-                        monitoradosEncontro: [p1.idMonitorado, p2.idMonitorado],
-                        timestamp: horario,
-                        posicoes: {
-                            [p1.idMonitorado]: { lat: p1.latitude, lon: p1.longitude },
-                            [p2.idMonitorado]: { lat: p2.latitude, lon: p2.longitude }
-                        },
-                        distanciaMetros: distancia
-                    });
-                }
+            const distancia = calcularDistancia(p1.latitude, p1.longitude, p2.latitude, p2.longitude);
+            if (distancia < DISTANCIA_LIMITE) {
+                encontros.push({
+                    tipo: classificarEncontro(p1, p2),
+                    monitoradosEncontro: [p1.idMonitorado, p2.idMonitorado],
+                    timestamp: horario,
+                    posicoes: {
+                        [p1.idMonitorado]: { lat: p1.latitude, lon: p1.longitude },
+                        [p2.idMonitorado]: { lat: p2.latitude, lon: p2.longitude }
+                    },
+                    distanciaMetros: distancia
+                });
             }
         }
     }
+}
 
+function lerLinha(linha: string): Posicionamento {
+    const colunas = linha.split(';');
+    const restricoes = colunas[6] ? colunas[6].replace(/"/g, '') : '';
 
-    fs.writeFileSync(nomeFicheiroOutput, JSON.stringify(encontrosDetetados, null, 2));
-    console.log(`✅ Sucesso: encontros guardados em ${nomeFicheiroOutput}\n`);
+    return {
+        idMonitorado: Number(colunas[0]),
+        faccaoMonitorado: colunas[1] ?? '',
+        timestamp: (colunas[2] ?? '').replace(/"/g, ''),
+        latitude: Number(colunas[3]),
+        longitude: Number(colunas[4]),
+        medidaProtetiva: colunas[5] === 'true',
+        idsRestricaoMedida: restricoes ? restricoes.split(',').map(Number) : []
+    };
+}
+
+// Os datasets vêm ordenados por timestamp. Por isso cada grupo é processado assim que
+// o timestamp muda e depois descartado: só um timestamp fica em memória por vez.
+async function processarDataset(numeroDataset: number): Promise<void> {
+    const nomeArquivoInput = `dataset${numeroDataset}.txt`;
+    const nomeArquivoOutput = `respostas${numeroDataset}.json`;
+
+    if (!fs.existsSync(nomeArquivoInput)) {
+        return;
+    }
+
+    console.log(`Processando ${nomeArquivoInput}...`);
+    const inicio = process.hrtime.bigint();
+
+    const rl = readline.createInterface({
+        input: fs.createReadStream(nomeArquivoInput),
+        crlfDelay: Infinity
+    });
+
+    const encontros: Encontro[] = [];
+    let grupoAtual: Posicionamento[] = [];
+    let horarioAtual = '';
+    let isPrimeiraLinha = true;
+
+    const fecharGrupo = () => {
+        if (grupoAtual.length === 0) return;
+        detectarEncontros(horarioAtual, grupoAtual, encontros);
+        grupoAtual = [];
+    };
+
+    // O evento 'line' processa cada linha de forma síncrona assim que ela é lida,
+    // sem enfileirar linhas em memória (como acontece com o `for await` do readline).
+    rl.on('line', (linha) => {
+        if (isPrimeiraLinha) {
+            isPrimeiraLinha = false;
+            return;
+        }
+        if (!linha) return;
+
+        const p = lerLinha(linha);
+        if (p.timestamp !== horarioAtual) {
+            // O formato YYYY-MM-DD HH:MM:SS ordena corretamente como texto.
+            if (p.timestamp < horarioAtual) {
+                console.warn(`⚠️  ${nomeArquivoInput} não está ordenado por timestamp (${p.timestamp} após ${horarioAtual}).`);
+            }
+            fecharGrupo();
+            horarioAtual = p.timestamp;
+        }
+        grupoAtual.push(p);
+    });
+    await once(rl, 'close');
+    fecharGrupo();
+
+    fs.writeFileSync(nomeArquivoOutput, JSON.stringify(encontros, null, 2));
+    const ms = Number(process.hrtime.bigint() - inicio) / 1e6;
+    console.log(`✅ ${encontros.length} encontros salvos em ${nomeArquivoOutput} (${ms.toFixed(0)} ms)\n`);
 }
 
 async function executarTudo() {
-    console.log("A iniciar processamento em lote...\n");
+    console.log("Iniciando processamento em lote...\n");
     for (let i = 1; i <= 7; i++) {
         await processarDataset(i);
     }

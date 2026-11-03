@@ -1,14 +1,16 @@
 {
   "name": "desafio-spacecom",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "index.ts",
+  "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "tsx index.ts",
+    "typecheck": "tsc --noEmit"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "Detecção de encontros entre monitorados e vítimas (desafio Trainee Tech Spacecom)",
   "devDependencies": {
     "@types/node": "^26.6.6",
     "ts-node": "^10.9.2",
